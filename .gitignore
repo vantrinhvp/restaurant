@@ -1,0 +1,78 @@
+# Byte-compiled / cache / temp files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.so
+*.log
+*.tmp
+*.swp
+*.bak
+*.old
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# VSCode settings
+.vscode/
+
+# Environment variables
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+*.pid
+docker-compose.override.yml
+
+# Data & results
+*.sqlite3
+*.db
+*.csv
+*.tsv
+*.h5
+*.hdf5
+*.parquet
+*.pkl
+*.joblib
+*.npy
+*.npz
+*.ckpt
+*.weights.h5
+*.onnx
+*.mlmodel
+*.pb
+*.tflite
+*.pt
+*.pth
+*.log
+logs/
+
+# Model artifacts
+runs/
+checkpoints/
+
+# Misc
+*.zip
+*.tar.gz
+*.tar
+*.rar
+*.7z
+*.bak
+*.orig
+*.rej
+main.py
+
+# Ignore local config
+local.txt
+docker.txt
+main.py

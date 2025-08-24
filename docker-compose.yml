@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  browser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: odoo:latest
+    ports:
+      - "8000:80"
+    expose:
+      - "80"
+    environment:
+      - API_KEY=${ODOO_API_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=${JWT_ACCESS_TOKEN_EXPIRE_MINUTES}
+    restart: unless-stopped
