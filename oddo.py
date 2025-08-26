@@ -495,14 +495,12 @@ async def create_appointment(
         customer_id = await get_or_create_customer(odoo, customer_info)
         guest_partner_ids = []
         
-        # Process booking lines - FIXED LOGIC
         booking_line_values = []
         resources = odoo.read('appointment.resource', resource_ids,
                               fields=['id', 'name', 'capacity'])
         asked_capacity = booking.capacity
         
         if appointment_type['schedule_based_on'] == 'resources':
-            # TÌM 1 RESOURCE DUY NHẤT CÓ ĐỦ CAPACITY CHO TẤT CẢ GUESTS
             selected_resource = None
             
             for resource in resources:
@@ -510,14 +508,12 @@ async def create_appointment(
                 resource_capacity_info = resources_remaining_capacity['resources_remaining_capacity'].get(resource_id, {})
                 resource_remaining_capacity = resource_capacity_info.get('remaining_capacity', 0)
                 
-                # Kiểm tra xem resource này có đủ capacity cho toàn bộ booking không
                 if resource_remaining_capacity >= asked_capacity:
                     selected_resource = resource
                     break
             
             if not selected_resource:
-                # Nếu không có resource nào đủ capacity, tìm resource có capacity lớn nhất
-                max_capacity_resource = max(resources, 
+                max_capacity_resource = max(resources,
                                           key=lambda r: resources_remaining_capacity['resources_remaining_capacity']
                                           .get(r['id'], {}).get('remaining_capacity', 0))
                 
@@ -530,14 +526,12 @@ async def create_appointment(
                            f"Maximum available capacity on one resource: {max_remaining}"
                 )
             
-            # Tạo 1 BOOKING LINE DUY NHẤT cho resource được chọn
             booking_line_values.append({
                 'appointment_resource_id': selected_resource['id'],
                 'capacity_reserved': asked_capacity,
                 'capacity_used': asked_capacity,
             })
 
-        # Tạo event với UTC time (Odoo sẽ tự động handle timezone display)
         event_vals = {
             'name': f"Đặt bàn {asked_capacity} người: {booking.customer_info.name}",
             'appointment_booker_id': customer_id,
@@ -726,7 +720,6 @@ async def get_appointment_types(
             fields=['appointment_resource_id', 'event_start', 'event_stop', 'capacity_used'],
         ))
 
-        # Group manually bằng Python
 
         total_capacity_used = 0
         resource_capacity_totals = defaultdict(int)
