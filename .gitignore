@@ -70,7 +70,7 @@ checkpoints/
 *.bak
 *.orig
 *.rej
-main.py
+
 
 # Ignore local config
 local.txt

@@ -444,9 +444,8 @@ async def create_appointment(
     """Create a new appointment booking"""
     try:
         # Validate appointment type exists
-        # Lấy appointment type và resource ids
         appointment_types = odoo.read('appointment.type', [booking.appointment_type_id],
-                                     fields=['resource_ids', 'name', 'schedule_based_on'])
+                                     fields=['resource_ids', 'name', 'schedule_based_on', 'appointment_tz'])
         if not appointment_types:
             raise HTTPException(
                 status_code=404,
@@ -455,24 +454,25 @@ async def create_appointment(
 
         appointment_type = appointment_types[0]
         resource_ids = appointment_type.get('resource_ids', [])
-        # Parse datetime
+        
+        # Parse datetime với timezone handling
         try:
             # Lấy timezone từ booking hoặc appointment type hoặc default
             timezone_str = booking.timezone or appointment_type.get('appointment_tz') or 'Asia/Saigon'
             tz = pytz.timezone(timezone_str)
-
+            
             # Parse datetime và localize với timezone
-            naive_datetime = datetime.strptime(booking.datetime_str, '%Y-%m-%d %H:%M:%S')
+            naive_datetime = datetime.strptime(booking.datetime_str, '%Y-%m-%d %H:%M')
             local_datetime = tz.localize(naive_datetime)
-
+            
             # Chuyển sang UTC để lưu vào Odoo
             start_date_utc = local_datetime.astimezone(pytz.UTC)
             date_end_utc = start_date_utc + timedelta(hours=booking.duration)
-
+            
             # Sử dụng UTC time để check capacity
             resources_remaining_capacity = get_resources_remaining_capacity(
                 odoo, appointment_type['id'], start_date_utc, date_end_utc)
-
+            
             if resources_remaining_capacity['summary']['total_remaining_capacity'] < booking.capacity:
                 raise HTTPException(
                     status_code=400,
@@ -494,41 +494,52 @@ async def create_appointment(
         # Handle customer
         customer_id = await get_or_create_customer(odoo, customer_info)
         guest_partner_ids = []
-        # Process question answers
-        # answer_input_values = await process_question_answers(
-        #     appointment_type, booking.answers, booking.appointment_type_id, customer['id']
-        # )
+        
+        # Process booking lines - FIXED LOGIC
         booking_line_values = []
         resources = odoo.read('appointment.resource', resource_ids,
                               fields=['id', 'name', 'capacity'])
         asked_capacity = booking.capacity
+        
         if appointment_type['schedule_based_on'] == 'resources':
-            capacity_to_assign = asked_capacity
+            # TÌM 1 RESOURCE DUY NHẤT CÓ ĐỦ CAPACITY CHO TẤT CẢ GUESTS
+            selected_resource = None
+            
             for resource in resources:
                 resource_id = resource['id']
-
-                resource_capacity_info = resources_remaining_capacity['resources_remaining_capacity'].get(resource_id,
-                                                                                                          {})
+                resource_capacity_info = resources_remaining_capacity['resources_remaining_capacity'].get(resource_id, {})
                 resource_remaining_capacity = resource_capacity_info.get('remaining_capacity', 0)
-
-                resource_total_capacity = resource.get('capacity', 1)
-
-                new_capacity_reserved = min(resource_remaining_capacity, capacity_to_assign, resource_total_capacity)
-                capacity_to_assign -= new_capacity_reserved
-
-                if new_capacity_reserved > 0:
-                    booking_line_values.append({
-                        'appointment_resource_id': resource_id,
-                        'capacity_reserved': new_capacity_reserved,
-                        'capacity_used': new_capacity_reserved,
-                    })
-
-                if capacity_to_assign <= 0:
+                
+                # Kiểm tra xem resource này có đủ capacity cho toàn bộ booking không
+                if resource_remaining_capacity >= asked_capacity:
+                    selected_resource = resource
                     break
+            
+            if not selected_resource:
+                # Nếu không có resource nào đủ capacity, tìm resource có capacity lớn nhất
+                max_capacity_resource = max(resources, 
+                                          key=lambda r: resources_remaining_capacity['resources_remaining_capacity']
+                                          .get(r['id'], {}).get('remaining_capacity', 0))
+                
+                max_remaining = resources_remaining_capacity['resources_remaining_capacity'].get(
+                    max_capacity_resource['id'], {}).get('remaining_capacity', 0)
+                
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No single resource can accommodate {asked_capacity} people. "
+                           f"Maximum available capacity on one resource: {max_remaining}"
+                )
+            
+            # Tạo 1 BOOKING LINE DUY NHẤT cho resource được chọn
+            booking_line_values.append({
+                'appointment_resource_id': selected_resource['id'],
+                'capacity_reserved': asked_capacity,
+                'capacity_used': asked_capacity,
+            })
 
-
+        # Tạo event với UTC time (Odoo sẽ tự động handle timezone display)
         event_vals = {
-            'name': f"Đặt bàn: {booking.customer_info.name}",
+            'name': f"Đặt bàn {asked_capacity} người: {booking.customer_info.name}",
             'appointment_booker_id': customer_id,
             'start': start_date_utc.strftime('%Y-%m-%d %H:%M:%S'),
             'stop': date_end_utc.strftime('%Y-%m-%d %H:%M:%S'),
@@ -536,6 +547,7 @@ async def create_appointment(
             'booking_line_ids': [(0, 0, vals) for vals in booking_line_values],
             'appointment_type_id': booking.appointment_type_id,
             'duration': booking.duration,
+            'appointment_status': 'request',
             'location': appointment_type.get('location', 'restaurant, Việt Nam'),
         }
 
@@ -544,15 +556,27 @@ async def create_appointment(
             'mail_notify_author': True,
             'mail_create_nolog': True,
             'mail_create_nosubscribe': True,
+            'tz': timezone_str,  # Set timezone context
         }
 
-        event_id = odoo.create('calendar.event', event_vals, {'context': context})
+        event_id = odoo.create('calendar.event', event_vals, context={'context': context})
 
         created_event = odoo.search_read('calendar.event', SearchRequest(
             domain=[('id', '=', event_id)],
             fields=['id', 'name', 'start', 'stop', 'location', 'access_token'],
             limit=1
         ))[0]
+        
+        # Convert UTC times back to local timezone for response
+        start_utc = datetime.strptime(created_event['start'], '%Y-%m-%d %H:%M:%S')
+        stop_utc = datetime.strptime(created_event['stop'], '%Y-%m-%d %H:%M:%S')
+        
+        start_utc = pytz.UTC.localize(start_utc)
+        stop_utc = pytz.UTC.localize(stop_utc)
+        
+        start_local = start_utc.astimezone(tz)
+        stop_local = stop_utc.astimezone(tz)
+        
         return AppointmentResponse(
             success=True,
             appointment_id=event_id,
@@ -561,25 +585,26 @@ async def create_appointment(
             appointment_details={
                 'id': event_id,
                 'name': created_event['name'],
-                'start_datetime': created_event['start'],
-                'end_datetime': created_event['stop'],
+                'start_datetime_local': start_local.strftime('%Y-%m-%d %H:%M:%S'),
+                'end_datetime_local': stop_local.strftime('%Y-%m-%d %H:%M:%S'),
+                'start_datetime_utc': created_event['start'],
+                'end_datetime_utc': created_event['stop'],
+                'timezone': timezone_str,
                 'duration': booking.duration,
                 'customer': booking.customer_info.name,
-                'staff':  None,
+                'capacity': asked_capacity,
+                'selected_resource': selected_resource['name'] if selected_resource else None,
+                'staff': None,
                 'location': created_event.get('location', ''),
             }
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         return AppointmentResponse(
             success=False,
             error=str(e)
-        )
-
-    except HTTPException:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
         )
     
 @app.post("/auth/login", response_model=AuthResponse)
