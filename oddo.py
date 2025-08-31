@@ -79,6 +79,15 @@ class AppointmentCreate(BaseModel):
     questions: Optional[Dict[str, Union[str, int, List[int]]]] = None
     timezone: Optional[str] = "Asia/Saigon"
 
+class AppointmentUpdate(BaseModel):
+    datetime_str: Optional[str] = None  # Format: 'YYYY-MM-DD HH:MM:SS'
+    duration: Optional[float] = None
+    customer_info: Optional[CustomerInfo] = None
+    capacity: Optional[int] = None
+    timezone: Optional[str] = "Asia/Saigon"
+    appointment_status: Optional[str] = None
+
+
 class AvailabilityRequest(BaseModel):
     date_from: str  # 'YYYY-MM-DD'
     date_to: str    # 'YYYY-MM-DD'
@@ -233,7 +242,7 @@ class OdooClient:
 # JWT functions
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 60)
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 60))
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -462,7 +471,7 @@ async def create_appointment(
             tz = pytz.timezone(timezone_str)
             
             # Parse datetime và localize với timezone
-            naive_datetime = datetime.strptime(booking.datetime_str, '%Y-%m-%d %H:%M')
+            naive_datetime = datetime.strptime(booking.datetime_str, '%Y-%m-%d %H:%M:%S')
             local_datetime = tz.localize(naive_datetime)
             
             # Chuyển sang UTC để lưu vào Odoo
@@ -692,71 +701,263 @@ async def delete_records(
 
 # Convenience endpoints for common models
 
-@app.get("/appointment/{appointment_type_id}")
-async def get_appointment_types(
-        appointment_type_id: int,
-        slot_start_utc: datetime,
-        slot_stop_utc: datetime,
+@app.put("/api/appointments/{appointment_id}")
+async def update_appointment(
+        appointment_id: int,
+        update_data: AppointmentUpdate,
         token: dict = Depends(verify_token),
-        odoo: OdooClient = Depends(get_odoo_client)
-):
+        odoo: OdooClient = Depends(get_odoo_client)):
+    """Update an existing appointment"""
     try:
-        appointment_type = odoo.read('appointment.type', [appointment_type_id], fields=['resource_ids'])
-
-        if not appointment_type:
-            raise HTTPException(status_code=404, detail=f"Appointment type with ID {appointment_type_id} not found")
-
-        appointment_type = appointment_type[0]
-        # slot_start_utc = datetime(slot_start_utc)
-        # slot_stop_utc = datetime(slot_stop_utc)
-
-        # Sử dụng search_read để lấy dữ liệu
-        booking_lines = odoo.search_read('appointment.booking.line', SearchRequest(
-            domain=[
-                ('appointment_resource_id', 'in', appointment_type.get('resource_ids', [])),
-                 ('event_start', '<', slot_stop_utc),
-                ('event_stop', '>', slot_start_utc)
-            ],
-            fields=['appointment_resource_id', 'event_start', 'event_stop', 'capacity_used'],
+        # Lấy thông tin appointment hiện tại
+        existing_appointments = odoo.search_read('calendar.event', SearchRequest(
+            domain=[('id', '=', appointment_id)],
+            fields=['id', 'name', 'start', 'stop', 'appointment_type_id', 'appointment_booker_id',
+                    'booking_line_ids', 'duration', 'appointment_status', 'location'],
+            limit=1
         ))
 
+        if not existing_appointments:
+            raise HTTPException(
+                status_code=404,
+                detail="Appointment not found"
+            )
 
-        total_capacity_used = 0
-        resource_capacity_totals = defaultdict(int)
-        resources_booking_lines = defaultdict(list)
-        for booking_line in booking_lines:
-            # Xử lý Many2one field (có thể là [id, name] hoặc chỉ id)
-            resource_id = booking_line['appointment_resource_id']
-            if isinstance(resource_id, list):
-                resource_id = resource_id[0]  # Lấy ID từ [id, name]
-            
-            resources_booking_lines[resource_id].append(booking_line)
-            capacity_used = booking_line.get('capacity_used', 0) or 0
-            total_capacity_used += capacity_used
-            resource_capacity_totals[resource_id] += capacity_used
+        existing_appointment = existing_appointments[0]
 
-         # Convert to regular dict
-        resources_booking_lines = dict(resources_booking_lines)
-        resource_capacity_totals = dict(resource_capacity_totals)
+        # Lấy appointment type info
+        appointment_type_id = existing_appointment['appointment_type_id']
+        if isinstance(appointment_type_id, list):
+            appointment_type_id = appointment_type_id[0]
+
+        appointment_types = odoo.read('appointment.type', [appointment_type_id],
+                                      fields=['resource_ids', 'name', 'schedule_based_on', 'appointment_tz'])
+        appointment_type = appointment_types[0]
+
+        # Chuẩn bị dữ liệu cập nhật
+        update_vals = {}
+
+        # Update datetime nếu có thay đổi
+        if update_data.datetime_str:
+            try:
+                timezone_str = update_data.timezone or appointment_type.get('appointment_tz') or 'Asia/Saigon'
+                tz = pytz.timezone(timezone_str)
+
+                # Parse và chuyển đổi timezone
+                naive_datetime = datetime.strptime(update_data.datetime_str, '%Y-%m-%d %H:%M:%S')
+                local_datetime = tz.localize(naive_datetime)
+                start_date_utc = local_datetime.astimezone(pytz.UTC)
+
+                # Tính duration
+                duration = update_data.duration or existing_appointment.get('duration', 1.0)
+                date_end_utc = start_date_utc + timedelta(hours=duration)
+
+                update_vals['start'] = start_date_utc.strftime('%Y-%m-%d %H:%M:%S')
+                update_vals['stop'] = date_end_utc.strftime('%Y-%m-%d %H:%M:%S')
+
+                if update_data.duration:
+                    update_vals['duration'] = update_data.duration
+
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid datetime: {str(e)}"
+                )
+
+        # Update capacity - cần xử lý booking lines
+        if update_data.capacity:
+            # Lấy thông tin booking lines hiện tại
+            existing_booking_lines = odoo.search_read('appointment.booking.line', SearchRequest(
+                domain=[('id', 'in', existing_appointment.get('booking_line_ids', []))],
+                fields=['id', 'appointment_resource_id', 'capacity_used', 'capacity_reserved']
+            ))
+
+            if existing_booking_lines:
+                # Kiểm tra capacity mới với resource hiện tại
+                current_resource_id = existing_booking_lines[0]['appointment_resource_id']
+                if isinstance(current_resource_id, list):
+                    current_resource_id = current_resource_id[0]
+
+                # Lấy thông tin thời gian để check availability
+                if 'start' in update_vals:
+                    start_check = datetime.strptime(update_vals['start'], '%Y-%m-%d %H:%M:%S')
+                    stop_check = datetime.strptime(update_vals['stop'], '%Y-%m-%d %H:%M:%S')
+                else:
+                    start_check = datetime.strptime(existing_appointment['start'], '%Y-%m-%d %H:%M:%S')
+                    stop_check = datetime.strptime(existing_appointment['stop'], '%Y-%m-%d %H:%M:%S')
+
+                start_check = pytz.UTC.localize(start_check)
+                stop_check = pytz.UTC.localize(stop_check)
+
+                # Check capacity availability (trừ booking hiện tại)
+                resources_remaining_capacity = get_resources_remaining_capacity(
+                    odoo, appointment_type_id, start_check, stop_check)
+
+                # Tính remaining capacity + capacity hiện tại đang sử dụng
+                current_capacity_used = sum([bl.get('capacity_used', 0) for bl in existing_booking_lines])
+                resource_capacity_info = resources_remaining_capacity['resources_remaining_capacity'].get(
+                    current_resource_id, {})
+                available_capacity = resource_capacity_info.get('remaining_capacity', 0) + current_capacity_used
+
+                if update_data.capacity > available_capacity:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Not enough capacity. Available: {available_capacity}, Requested: {update_data.capacity}"
+                    )
+
+                # Update booking lines
+                for booking_line in existing_booking_lines:
+                    odoo.update('appointment.booking.line', [booking_line['id']], {
+                        'capacity_used': update_data.capacity,
+                        'capacity_reserved': update_data.capacity,
+                    })
+
+        # Update customer info
+        if update_data.customer_info:
+            customer_id = await get_or_create_customer(odoo, update_data.customer_info)
+            update_vals['appointment_booker_id'] = customer_id
+
+            # Update tên appointment
+            capacity = update_data.capacity or (
+                existing_booking_lines[0].get('capacity_used') if existing_booking_lines else 1)
+            update_vals['name'] = f"Đặt bàn {capacity} người: {update_data.customer_info.name}"
+
+        # Update status
+        if update_data.appointment_status:
+            update_vals['appointment_status'] = update_data.appointment_status
+
+        # Thực hiện update
+        if update_vals:
+            odoo.update('calendar.event', [appointment_id], update_vals)
+
+        # Lấy thông tin đã update
+        updated_appointment = odoo.search_read('calendar.event', SearchRequest(
+            domain=[('id', '=', appointment_id)],
+            fields=['id', 'name', 'start', 'stop', 'location', 'access_token', 'appointment_status'],
+            limit=1
+        ))[0]
+
+        # Convert UTC times back to local timezone for response
+        timezone_str = update_data.timezone or appointment_type.get('appointment_tz') or 'Asia/Saigon'
+        tz = pytz.timezone(timezone_str)
+
+        start_utc = datetime.strptime(updated_appointment['start'], '%Y-%m-%d %H:%M:%S')
+        stop_utc = datetime.strptime(updated_appointment['stop'], '%Y-%m-%d %H:%M:%S')
+
+        start_utc = pytz.UTC.localize(start_utc)
+        stop_utc = pytz.UTC.localize(stop_utc)
+
+        start_local = start_utc.astimezone(tz)
+        stop_local = stop_utc.astimezone(tz)
+
+        return AppointmentResponse(
+            success=True,
+            appointment_id=appointment_id,
+            access_token=updated_appointment.get('access_token'),
+            message="Appointment updated successfully",
+            appointment_details={
+                'id': appointment_id,
+                'name': updated_appointment['name'],
+                'start_datetime_local': start_local.strftime('%Y-%m-%d %H:%M:%S'),
+                'end_datetime_local': stop_local.strftime('%Y-%m-%d %H:%M:%S'),
+                'start_datetime_utc': updated_appointment['start'],
+                'end_datetime_utc': updated_appointment['stop'],
+                'timezone': timezone_str,
+                'status': updated_appointment.get('appointment_status', 'request'),
+                'location': updated_appointment.get('location', ''),
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        return AppointmentResponse(
+            success=False,
+            error=str(e)
+        )
+
+
+# Thêm API get appointment detail
+@app.get("/api/appointments/{appointment_id}")
+async def get_appointment(
+        appointment_id: int,
+        token: dict = Depends(verify_token),
+        odoo: OdooClient = Depends(get_odoo_client)):
+    """Get appointment details"""
+    try:
+        appointments = odoo.search_read('calendar.event', SearchRequest(
+            domain=[('id', '=', appointment_id)],
+            fields=['id', 'name', 'start', 'stop', 'appointment_type_id', 'appointment_booker_id',
+                    'booking_line_ids', 'duration', 'appointment_status', 'location', 'access_token'],
+            limit=1
+        ))
+
+        if not appointments:
+            raise HTTPException(
+                status_code=404,
+                detail="Appointment not found"
+            )
+
+        appointment = appointments[0]
+
+        # Lấy thông tin booking lines
+        booking_lines = []
+        if appointment.get('booking_line_ids'):
+            booking_lines = odoo.search_read('appointment.booking.line', SearchRequest(
+                domain=[('id', 'in', appointment['booking_line_ids'])],
+                fields=['appointment_resource_id', 'capacity_used', 'capacity_reserved']
+            ))
+
+        # Lấy thông tin customer
+        customer_info = None
+        if appointment.get('appointment_booker_id'):
+            customer_id = appointment['appointment_booker_id']
+            if isinstance(customer_id, list):
+                customer_id = customer_id[0]
+
+            customers = odoo.read('res.partner', [customer_id],
+                                  fields=['name', 'email', 'phone'])
+            if customers:
+                customer_info = customers[0]
 
         return OdooResponse(
             success=True,
             data={
-                'appointment_type': appointment_type,
-                'resources_booking_lines': resources_booking_lines,
-                'total_capacity_used': total_capacity_used,
-                'resource_capacity_totals': resource_capacity_totals,
-                'summary': {
-                    'total_bookings': len(booking_lines),
-                    'total_capacity_used': total_capacity_used,
-                    'resources_count': len(resources_booking_lines)
-                }
-            },
-            count=len(resources_booking_lines)
+                'appointment': appointment,
+                'booking_lines': booking_lines,
+                'customer': customer_info,
+                'total_capacity': sum([bl.get('capacity_used', 0) for bl in booking_lines])
+            }
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Thêm API cancel appointment
+@app.delete("/api/appointments/{appointment_id}")
+async def cancel_appointment(
+        appointment_id: int,
+        token: dict = Depends(verify_token),
+        odoo: OdooClient = Depends(get_odoo_client)):
+    """Cancel an appointment"""
+    try:
+        # Update status thay vì delete
+        odoo.update('calendar.event', [appointment_id], {
+            'appointment_status': 'cancelled'
+        })
+
+        return AppointmentResponse(
+            success=True,
+            appointment_id=appointment_id,
+            message="Appointment cancelled successfully"
+        )
+
+    except Exception as e:
+        return AppointmentResponse(
+            success=False,
+            error=str(e)
+        )
 
 
 @app.get("/health")
@@ -766,4 +967,4 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
